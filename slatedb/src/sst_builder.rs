@@ -320,7 +320,11 @@ impl EncodedSsTableBuilder {
         // an OS thread on the same host under flush+compaction load).
         // Yielding once per finished block bounds each poll to roughly one
         // block of CPU at negligible cost.
-        tokio::task::yield_now().await;
+        // EXPERIMENT GATE (exp/merge-yield-isolation only): YIELD_SST=0
+        // disables this yield for isolated A/B measurement.
+        if std::env::var("YIELD_SST").map(|v| v != "0").unwrap_or(true) {
+            tokio::task::yield_now().await;
+        }
 
         Ok(Some(block_size))
     }

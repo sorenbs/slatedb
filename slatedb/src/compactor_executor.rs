@@ -834,7 +834,10 @@ impl TokioCompactionExecutorInner {
             entries_since_yield += 1;
             if entries_since_yield >= 1024 {
                 entries_since_yield = 0;
-                tokio::task::yield_now().await;
+                // EXPERIMENT GATE (exp/merge-yield-isolation only).
+                if std::env::var("YIELD_MERGE").map(|v| v != "0").unwrap_or(true) {
+                    tokio::task::yield_now().await;
+                }
             }
             // Opportunistically collect a finished background close without
             // stalling the merge loop to promptly lets us report progress
