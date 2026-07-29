@@ -90,12 +90,12 @@ impl GcTask for ManifestGcTask {
         // pin source) is read fresh every sweep; only the candidate
         // inventory below may come from a cached listing (list_cache_ttl).
         let latest = self.manifest_store.read_latest_manifest().await?;
-        let refresh_floor = self.manifest_options.min_age.max(
-            self.manifest_options
-                .interval
-                .unwrap_or(super::DEFAULT_INTERVAL)
-                * 2,
-        );
+        let refresh_floor = (self
+            .manifest_options
+            .interval
+            .unwrap_or(super::DEFAULT_INTERVAL)
+            * 2)
+        .max(std::time::Duration::from_secs(60));
         let manifest_metadata_list = self
             .dir_listing
             .entries(
@@ -126,7 +126,7 @@ impl GcTask for ManifestGcTask {
                         > min_age
             })
             .collect::<Vec<_>>();
-        self.dir_listing.note_sweep(!manifests_to_delete.is_empty());
+        self.dir_listing.note_sweep_at(utc_now, !manifests_to_delete.is_empty());
 
         // Advance the boundary to the latest manifest selected by the GC model. The optional GC
         // filter only gates the final deletion pass.

@@ -76,21 +76,23 @@ trait GcTask {
 /// task clones so every sweep of a resource works off one inventory.
 ///
 /// Refresh policy: a view is replaced when it reaches `ttl`, and EARLY —
-/// after `refresh_floor` — once a sweep reports finding no candidates in it
-/// (`note_empty_sweep`). Without the early refresh, a busy directory whose
+/// `refresh_floor` after the first sweep that finds no candidates in it
+/// (`note_sweep(false)`). Without the early refresh, a busy directory whose
 /// churn all postdates the cached listing would collect nothing for a whole
 /// TTL (measured on the 30-min soak: deletes 50,877 → 25), ballooning WAL
-/// retention and reopen listings. With it, deletion latency is bounded by
-/// ~`refresh_floor` while busy directories still drain the cached view
-/// LIST-free between refreshes.
+/// retention and reopen listings. The floor is measured from EXHAUSTION,
+/// not from the listing: a view can drain productively for a long time,
+/// and what the floor bounds is how long a drained view may blind the
+/// sweep to newer garbage. Refreshing early never deletes anything early —
+/// candidates still pass the min_age and anchor filters.
 struct CachedDirListing<M> {
     view: Arc<parking_lot::Mutex<DirView<M>>>,
 }
 
 struct DirView<M> {
     listed: Option<(DateTime<Utc>, Vec<M>)>,
-    /// The last sweep found nothing to do in the cached view.
-    exhausted: bool,
+    /// When sweeps started coming up empty against this view.
+    exhausted_since: Option<DateTime<Utc>>,
 }
 
 impl<M: Clone> CachedDirListing<M> {
@@ -98,7 +100,7 @@ impl<M: Clone> CachedDirListing<M> {
         Self {
             view: Arc::new(parking_lot::Mutex::new(DirView {
                 listed: None,
-                exhausted: false,
+                exhausted_since: None,
             })),
         }
     }
@@ -119,14 +121,13 @@ impl<M: Clone> CachedDirListing<M> {
             let view = self.view.lock();
             if let Some((at, entries)) = view.listed.as_ref() {
                 let age = utc_now.signed_duration_since(*at);
-                let limit = if view.exhausted {
-                    ttl.min(refresh_floor)
-                } else {
-                    ttl
+                let ttl = chrono::Duration::from_std(ttl).expect("invalid ttl");
+                let floor = chrono::Duration::from_std(refresh_floor).expect("invalid floor");
+                let stale = match view.exhausted_since {
+                    Some(since) => utc_now.signed_duration_since(since) >= floor,
+                    None => false,
                 };
-                if age >= chrono::Duration::zero()
-                    && age < chrono::Duration::from_std(limit).expect("invalid ttl")
-                {
+                if age >= chrono::Duration::zero() && age < ttl && !stale {
                     return Ok(entries.clone());
                 }
             }
@@ -134,14 +135,20 @@ impl<M: Clone> CachedDirListing<M> {
         let fresh = list.await?;
         let mut view = self.view.lock();
         view.listed = Some((utc_now, fresh.clone()));
-        view.exhausted = false;
+        view.exhausted_since = None;
         Ok(fresh)
     }
 
-    /// Record whether the sweep found any candidates in the view. An empty
-    /// sweep arms the early (`refresh_floor`) refresh.
-    fn note_sweep(&self, found_candidates: bool) {
-        self.view.lock().exhausted = !found_candidates;
+    /// Record whether the sweep found any candidates in the view. The first
+    /// empty sweep starts the early-refresh clock; a productive sweep
+    /// resets it.
+    fn note_sweep_at(&self, utc_now: DateTime<Utc>, found_candidates: bool) {
+        let mut view = self.view.lock();
+        if found_candidates {
+            view.exhausted_since = None;
+        } else if view.exhausted_since.is_none() {
+            view.exhausted_since = Some(utc_now);
+        }
     }
 
     /// Drop entries matching `deleted` from the cached view (call after a
@@ -3040,7 +3047,7 @@ mod cached_dir_listing_tests {
             .await
             .unwrap();
         assert!(got.is_empty());
-        listing.note_sweep(false);
+        listing.note_sweep_at(t0, false);
 
         // Before the floor: still served from the (empty) cache.
         listing
@@ -3059,7 +3066,7 @@ mod cached_dir_listing_tests {
 
         // A productive sweep disarms the floor: the next read within the
         // TTL is served from cache again.
-        listing.note_sweep(true);
+        listing.note_sweep_at(t0 + TimeDelta::seconds(121), true);
         listing
             .entries(t0 + TimeDelta::seconds(600), ttl, floor, counted_list(&lists, vec![8]))
             .await
