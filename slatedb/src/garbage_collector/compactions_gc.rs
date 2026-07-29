@@ -81,11 +81,18 @@ impl GcTask for CompactionsGcTask {
         let Some(latest) = self.compactions_store.try_read_latest_compactions().await? else {
             return Ok(0);
         };
+        let refresh_floor = self.compactions_options.min_age.max(
+            self.compactions_options
+                .interval
+                .unwrap_or(super::DEFAULT_INTERVAL)
+                * 2,
+        );
         let compactions_metadata_list = self
             .dir_listing
             .entries(
                 utc_now,
                 self.compactions_options.list_cache_ttl,
+                refresh_floor,
                 self.compactions_store.list_compactions(..),
             )
             .await?;
@@ -99,6 +106,8 @@ impl GcTask for CompactionsGcTask {
                         > min_age
             })
             .collect::<Vec<_>>();
+        self.dir_listing
+            .note_sweep(!compactions_to_delete.is_empty());
 
         // Advance the boundary to the latest compactions file selected by the GC model. The
         // optional GC filter only gates the final deletion pass.
