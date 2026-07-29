@@ -1458,6 +1458,7 @@ impl Default for GarbageCollectorDirectoryOptions {
             min_age: DEFAULT_MIN_AGE,
             dry_run: false,
             max_interval: None,
+            list_cache_ttl: None,
         }
     }
 }
@@ -1495,6 +1496,21 @@ pub struct GarbageCollectorDirectoryOptions {
     #[serde(deserialize_with = "deserialize_option_duration")]
     #[serde(serialize_with = "serialize_option_duration")]
     pub max_interval: Option<Duration>,
+
+    /// Reuse each directory LIST result as the candidate inventory for this
+    /// long. Between refreshes, sweeps still run at full cadence — deletion
+    /// anchors (latest manifest, checkpoint references, the WAL replay
+    /// boundary, compaction watermarks) are re-read fresh every sweep, and
+    /// deleted entries are pruned from the cached view — but no LIST request
+    /// is issued. Objects created after the cached listing are simply
+    /// invisible until the next refresh, which can only *delay* their
+    /// collection (never delete anything early), so the sole cost is
+    /// garbage lingering up to this TTL longer. None (the default) lists on
+    /// every sweep — exactly the previous behavior.
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_option_duration")]
+    #[serde(serialize_with = "serialize_option_duration")]
+    pub list_cache_ttl: Option<Duration>,
 }
 
 /// Schedule options for a GC task that has no file-age threshold.

@@ -7,7 +7,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask};
+use super::{CachedDirListing, GcFilter, GcStats, GcTask};
+use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 
 #[derive(Clone)]
 pub(crate) struct ManifestGcTask {
@@ -15,6 +16,7 @@ pub(crate) struct ManifestGcTask {
     stats: Arc<GcStats>,
     manifest_options: GarbageCollectorDirectoryOptions,
     gc_filter: Option<Arc<dyn GcFilter>>,
+    dir_listing: CachedDirListing<IdentifiedObjectMetadata<u64>>,
 }
 
 impl std::fmt::Debug for ManifestGcTask {
@@ -37,6 +39,7 @@ impl ManifestGcTask {
             stats,
             manifest_options,
             gc_filter,
+            dir_listing: CachedDirListing::new(),
         }
     }
 
@@ -50,31 +53,35 @@ impl GcTask for ManifestGcTask {
     /// that are older than the minimum age specified in the options.
     async fn collect(&self, utc_now: DateTime<Utc>) -> Result<usize, SlateDBError> {
         let min_age = self.manifest_min_age();
-        let mut manifest_metadata_list = self.manifest_store.list_manifests(..).await?;
-
-        // Remove the last element so we never delete the latest manifest
-        let latest_manifest = if let Some(manifest_metadata) = manifest_metadata_list.pop() {
-            self.manifest_store
-                .read_manifest(manifest_metadata.id)
-                .await?
-        } else {
-            return Err(SlateDBError::LatestTransactionalObjectVersionMissing);
-        };
+        // The latest manifest (the never-delete anchor and the checkpoint
+        // pin source) is read fresh every sweep; only the candidate
+        // inventory below may come from a cached listing (list_cache_ttl).
+        let latest = self.manifest_store.read_latest_manifest().await?;
+        let manifest_metadata_list = self
+            .dir_listing
+            .entries(
+                utc_now,
+                self.manifest_options.list_cache_ttl,
+                self.manifest_store.list_manifests(..),
+            )
+            .await?;
 
         // Do not delete manifests which are still referenced by active checkpoints
-        let active_manifest_ids: HashSet<_> = latest_manifest
+        let active_manifest_ids: HashSet<_> = latest
+            .manifest
             .core
             .checkpoints
             .iter()
             .map(|checkpoint| checkpoint.manifest_id)
             .collect();
 
-        // Delete manifests older than min_age
+        // Delete manifests older than min_age, never the latest
         let manifests_to_delete = manifest_metadata_list
             .into_iter()
             .filter(|manifest_metadata| {
                 let is_active = active_manifest_ids.contains(&manifest_metadata.id);
-                !is_active
+                manifest_metadata.id < latest.id
+                    && !is_active
                     && utc_now.signed_duration_since(manifest_metadata.metadata.last_modified)
                         > min_age
             })
@@ -98,6 +105,7 @@ impl GcTask for ManifestGcTask {
             );
         }
         let found = manifests_to_delete.len();
+        let mut deleted = HashSet::new();
         for manifest_metadata in manifests_to_delete {
             if self.manifest_options.dry_run {
                 log::debug!(
@@ -116,9 +124,11 @@ impl GcTask for ManifestGcTask {
                     manifest_metadata.id, e
                 );
             } else {
+                deleted.insert(manifest_metadata.id);
                 self.stats.gc_manifest_count.increment(1);
             }
         }
+        self.dir_listing.forget(|m| deleted.contains(&m.id));
 
         Ok(found)
     }
@@ -184,6 +194,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             },
             None,
         );
@@ -208,6 +219,64 @@ mod tests {
                 .map(|manifest| manifest.id)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// With `list_cache_ttl` set, sweeps between refreshes reuse the cached
+    /// inventory. The version that was LATEST at listing time is in that
+    /// inventory (it was protected only by the `id < latest` predicate), so
+    /// once a newer version supersedes it, a later sweep must delete it from
+    /// the stale view — no fresh LIST required. Manifests written after the
+    /// listing stay invisible (and undeletable) until the TTL refresh.
+    #[tokio::test]
+    async fn test_cached_view_deletes_previous_latest_after_supersession() {
+        let object_store = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(
+            &Path::from("/root"),
+            object_store.clone(),
+        ));
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        stored_manifest
+            .update(stored_manifest.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+
+        let recorder = MetricsRecorderHelper::noop();
+        let task = ManifestGcTask::new(
+            manifest_store.clone(),
+            Arc::new(GcStats::new(&recorder)),
+            GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(1),
+                interval: None,
+                dry_run: false,
+                max_interval: None,
+                list_cache_ttl: Some(Duration::from_secs(7200)),
+            },
+            None,
+        );
+
+        // First sweep caches the inventory [1, 2]: deletes 1, keeps latest 2.
+        let sweep1 = Utc::now() + TimeDelta::hours(1);
+        task.collect(sweep1).await.unwrap();
+        assert!(manifest_store.try_read_manifest(1).await.unwrap().is_none());
+        assert!(manifest_store.try_read_manifest(2).await.unwrap().is_some());
+
+        // Supersede 2 with 3, then sweep again well within the view TTL.
+        stored_manifest
+            .update(stored_manifest.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+        task.collect(sweep1 + TimeDelta::seconds(5)).await.unwrap();
+        assert!(
+            manifest_store.try_read_manifest(2).await.unwrap().is_none(),
+            "superseded previous-latest must be deleted from the stale cached view"
+        );
+        assert!(manifest_store.try_read_manifest(3).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -242,6 +311,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             },
             Some(Arc::new(DenyAllGcFilter) as Arc<dyn GcFilter>),
         );

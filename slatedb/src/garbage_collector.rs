@@ -64,6 +64,68 @@ trait GcTask {
     async fn collect(&self, now: DateTime<Utc>) -> Result<usize, SlateDBError>;
 }
 
+/// A directory listing reused as the candidate inventory across sweeps (see
+/// `GarbageCollectorDirectoryOptions::list_cache_ttl`). Entries are pruned as
+/// they are deleted; objects created after the listing stay invisible until
+/// the next refresh, which only ever *delays* their collection. Shared across
+/// task clones so every sweep of a resource works off one inventory.
+struct CachedDirListing<M> {
+    view: Arc<parking_lot::Mutex<Option<(DateTime<Utc>, Vec<M>)>>>,
+}
+
+impl<M: Clone> CachedDirListing<M> {
+    fn new() -> Self {
+        Self {
+            view: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// Return the cached listing if it is younger than `ttl`, else fetch a
+    /// fresh one via `list` and cache it. `ttl: None` always fetches
+    /// (the pre-cache behavior).
+    async fn entries<E, F>(
+        &self,
+        utc_now: DateTime<Utc>,
+        ttl: Option<Duration>,
+        list: F,
+    ) -> Result<Vec<M>, E>
+    where
+        F: std::future::Future<Output = Result<Vec<M>, E>>,
+    {
+        if let Some(ttl) = ttl {
+            let cached = self.view.lock().clone();
+            if let Some((at, entries)) = cached {
+                let age = utc_now.signed_duration_since(at);
+                if age >= chrono::Duration::zero()
+                    && age < chrono::Duration::from_std(ttl).expect("invalid ttl")
+                {
+                    return Ok(entries);
+                }
+            }
+        }
+        let fresh = list.await?;
+        *self.view.lock() = Some((utc_now, fresh.clone()));
+        Ok(fresh)
+    }
+
+    /// Drop entries matching `deleted` from the cached view (call after a
+    /// successful delete so later sweeps don't retry it).
+    fn forget<F: Fn(&M) -> bool>(&self, deleted: F) {
+        let mut view = self.view.lock();
+        if let Some((_, entries)) = view.as_mut() {
+            entries.retain(|m| !deleted(m));
+        }
+    }
+}
+
+impl<M> Clone for CachedDirListing<M> {
+    fn clone(&self) -> Self {
+        Self {
+            view: self.view.clone(),
+        }
+    }
+}
+
 /// Effective delay before the next productive sweep: base doubled per
 /// consecutive empty sweep, capped at `max`. Pure so the policy is unit
 /// testable independent of tickers and clocks.
@@ -1242,6 +1304,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             compacted_options: None,
@@ -1310,6 +1373,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compacted_options: None,
             compactions_options: None,
@@ -1376,6 +1440,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compacted_options: None,
             compactions_options: None,
@@ -1450,12 +1515,14 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compacted_options: None,
             compactions_options: None,
@@ -1897,12 +1964,14 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_options: Some(crate::config::GarbageCollectorDirectoryOptions {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             compacted_options: Some(crate::config::GarbageCollectorDirectoryOptions {
@@ -1910,12 +1979,14 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compactions_options: Some(crate::config::GarbageCollectorDirectoryOptions {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             detach_options: None,
             metric_level: None,
@@ -1976,12 +2047,14 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             compacted_options: Some(GarbageCollectorDirectoryOptions {
@@ -1989,12 +2062,14 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             detach_options: None,
             metric_level: None,
@@ -2055,6 +2130,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             compacted_options: Some(GarbageCollectorDirectoryOptions {
@@ -2062,12 +2138,14 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             detach_options: None,
             metric_level: None,
@@ -2107,12 +2185,14 @@ mod tests {
                 interval: Some(Duration::from_secs(11)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(13)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compacted_options: None,
             compactions_options: Some(GarbageCollectorDirectoryOptions {
@@ -2120,6 +2200,7 @@ mod tests {
                 interval: Some(Duration::from_secs(17)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             detach_options: None,
             metric_level: None,
@@ -2158,12 +2239,14 @@ mod tests {
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_options: Some(crate::config::GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             compacted_options: Some(crate::config::GarbageCollectorDirectoryOptions {
@@ -2171,12 +2254,14 @@ mod tests {
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compactions_options: Some(crate::config::GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             detach_options: None,
             metric_level: None,
@@ -2502,6 +2587,7 @@ mod tests {
             interval: None,
             dry_run: false,
             max_interval: None,
+            list_cache_ttl: None,
         };
         let gc_opts = GarbageCollectorOptions {
             manifest_options: Some(options),
@@ -2604,6 +2690,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             compacted_options: None,
@@ -2735,6 +2822,7 @@ mod tests {
             interval: None,
             dry_run: true,
             max_interval: None,
+            list_cache_ttl: None,
         };
         let gc_opts = GarbageCollectorOptions {
             manifest_options: Some(dry_run_options),
@@ -2788,6 +2876,108 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+mod cached_dir_listing_tests {
+    use super::CachedDirListing;
+    use chrono::{TimeDelta, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn counted_list(
+        counter: &AtomicUsize,
+        entries: Vec<u64>,
+    ) -> impl std::future::Future<Output = Result<Vec<u64>, ()>> + '_ {
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(entries)
+        }
+    }
+
+    #[tokio::test]
+    async fn ttl_none_lists_every_sweep() {
+        let listing: CachedDirListing<u64> = CachedDirListing::new();
+        let lists = AtomicUsize::new(0);
+        let now = Utc::now();
+        for _ in 0..3 {
+            let got = listing
+                .entries(now, None, counted_list(&lists, vec![1, 2]))
+                .await
+                .unwrap();
+            assert_eq!(vec![1, 2], got);
+        }
+        assert_eq!(3, lists.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fresh_view_is_reused_within_ttl_and_refreshed_after() {
+        let listing: CachedDirListing<u64> = CachedDirListing::new();
+        let lists = AtomicUsize::new(0);
+        let ttl = Some(Duration::from_secs(600));
+        let t0 = Utc::now();
+
+        let got = listing
+            .entries(t0, ttl, counted_list(&lists, vec![1, 2]))
+            .await
+            .unwrap();
+        assert_eq!(vec![1, 2], got);
+
+        // Within TTL: cached view served, second listing (with new data) unused.
+        let got = listing
+            .entries(t0 + TimeDelta::seconds(599), ttl, counted_list(&lists, vec![1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(vec![1, 2], got);
+        assert_eq!(1, lists.load(Ordering::SeqCst));
+
+        // Past TTL: refreshed.
+        let got = listing
+            .entries(t0 + TimeDelta::seconds(601), ttl, counted_list(&lists, vec![1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(vec![1, 2, 3], got);
+        assert_eq!(2, lists.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn forget_prunes_deleted_entries_from_the_cached_view() {
+        let listing: CachedDirListing<u64> = CachedDirListing::new();
+        let lists = AtomicUsize::new(0);
+        let ttl = Some(Duration::from_secs(600));
+        let t0 = Utc::now();
+
+        listing
+            .entries(t0, ttl, counted_list(&lists, vec![1, 2, 3]))
+            .await
+            .unwrap();
+        listing.forget(|id| *id <= 2);
+        let got = listing
+            .entries(t0 + TimeDelta::seconds(1), ttl, counted_list(&lists, vec![]))
+            .await
+            .unwrap();
+        assert_eq!(vec![3], got);
+        assert_eq!(1, lists.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn clock_regression_refreshes_instead_of_trusting_the_future_view() {
+        let listing: CachedDirListing<u64> = CachedDirListing::new();
+        let lists = AtomicUsize::new(0);
+        let ttl = Some(Duration::from_secs(600));
+        let t0 = Utc::now();
+
+        listing
+            .entries(t0, ttl, counted_list(&lists, vec![1]))
+            .await
+            .unwrap();
+        let got = listing
+            .entries(t0 - TimeDelta::seconds(30), ttl, counted_list(&lists, vec![2]))
+            .await
+            .unwrap();
+        assert_eq!(vec![2], got);
+        assert_eq!(2, lists.load(Ordering::SeqCst));
+    }
+}
+
 #[cfg(test)]
 mod adaptive_cadence_tests {
     use super::next_gc_delay;

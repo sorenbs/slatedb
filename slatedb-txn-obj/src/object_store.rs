@@ -27,13 +27,41 @@ use std::sync::Arc;
 /// - New versions must use the next consecutive id (`current_id + 1`).
 /// - We rely on `put_if_not_exists` to enforce CAS at the storage layer. If a file with
 ///   the same id already exists, the write fails with `ObjectVersionExists`.
+///
+/// ## Latest-version reads
+/// Because ids are dense at creation (every successful write is exactly its
+/// predecessor's id + 1), the latest version can be found without listing the
+/// directory whenever a previously observed version is known: probe `known + 1`
+/// with a GET, walk forward while versions are found, and when the first probe
+/// misses, revalidate the anchor with a conditional GET (`If-None-Match`). The
+/// instance caches the newest observed version (id, etag, encoded bytes) to
+/// serve as that anchor; writes seed it for free. LIST remains the discovery
+/// path when the cache is cold, when the anchor has been deleted out from
+/// under us (GC), or when the cache is more than [`PROBE_LIMIT`] versions
+/// behind (one LIST jumps to the tail; probing would pay one GET per version).
+/// Every returned value is freshly fetched or 304-revalidated — the cache is a
+/// hint, never trusted for liveness.
 pub struct ObjectStoreSequencedStorageProtocol<T> {
     object_store: Arc<dyn ObjectStore>,
     dir_path: Path,
     codec: Box<dyn ObjectCodec<T>>,
     file_suffix: &'static str,
     boundary: Arc<dyn BoundaryObject>,
+    latest_cache: Mutex<Option<CachedLatest>>,
 }
+
+/// Newest version observed by this protocol instance, kept as encoded bytes so
+/// the cache needs no bounds on `T`.
+#[derive(Clone)]
+struct CachedLatest {
+    id: MonotonicId,
+    e_tag: Option<String>,
+    bytes: bytes::Bytes,
+}
+
+/// After walking this many consecutive found-versions past the cached anchor,
+/// fall back to one LIST to jump to the tail instead of paying GET-per-version.
+const PROBE_LIMIT: usize = 8;
 
 impl<T> ObjectStoreSequencedStorageProtocol<T> {
     pub fn new(
@@ -72,6 +100,7 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
             codec,
             file_suffix,
             boundary,
+            latest_cache: Mutex::new(None),
         }
     }
 
@@ -79,6 +108,121 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
         self.dir_path
             .clone()
             .join(format!("{:020}.{}", id.id(), self.file_suffix))
+    }
+
+    /// Fetch one version's raw bytes plus etag; `None` if it does not exist.
+    async fn fetch_version(
+        &self,
+        id: MonotonicId,
+    ) -> Result<Option<(Option<String>, bytes::Bytes)>, TransactionalObjectError> {
+        match self.object_store.get(&self.path_for(id)).await {
+            Ok(obj) => {
+                let e_tag = obj.meta.e_tag.clone();
+                let bytes = obj.bytes().await?;
+                Ok(Some((e_tag, bytes)))
+            }
+            Err(Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(TransactionalObjectError::from(e)),
+        }
+    }
+
+    /// Advance the cached latest, never moving it backward. Versions are
+    /// immutable once created, so equal ids carry identical bytes.
+    fn cache_latest(&self, candidate: CachedLatest) {
+        let mut cache = self.latest_cache.lock();
+        match cache.as_ref() {
+            Some(cached) if cached.id >= candidate.id => {}
+            _ => *cache = Some(candidate),
+        }
+    }
+
+    /// Drop the cache iff it still holds `id` (it was deleted out from under us).
+    fn invalidate_cached(&self, id: MonotonicId) {
+        let mut cache = self.latest_cache.lock();
+        if cache.as_ref().is_some_and(|c| c.id == id) {
+            *cache = None;
+        }
+    }
+
+    /// Confirm the anchor version still exists, reusing cached bytes via a
+    /// conditional GET when we hold an etag. Returns `None` if it is gone.
+    async fn revalidate_anchor(
+        &self,
+        cur: &CachedLatest,
+    ) -> Result<Option<CachedLatest>, TransactionalObjectError> {
+        let Some(e_tag) = cur.e_tag.clone() else {
+            return Ok(self.fetch_version(cur.id).await?.map(|(e_tag, bytes)| {
+                CachedLatest {
+                    id: cur.id,
+                    e_tag,
+                    bytes,
+                }
+            }));
+        };
+        let opts = GetOptions {
+            if_none_match: Some(e_tag),
+            ..GetOptions::default()
+        };
+        match self.object_store.get_opts(&self.path_for(cur.id), opts).await {
+            Err(Error::NotModified { .. }) => Ok(Some(cur.clone())),
+            // Created versions are immutable, so a changed etag is unexpected —
+            // but trust the store and refresh our copy.
+            Ok(obj) => {
+                let e_tag = obj.meta.e_tag.clone();
+                let bytes = obj.bytes().await?;
+                Ok(Some(CachedLatest {
+                    id: cur.id,
+                    e_tag,
+                    bytes,
+                }))
+            }
+            Err(Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(TransactionalObjectError::from(e)),
+        }
+    }
+
+    /// Try to resolve the latest version from the cached anchor without a LIST.
+    /// `Ok(None)` means "no verdict — discover via LIST" (cold cache, anchor
+    /// deleted, or tail more than [`PROBE_LIMIT`] versions ahead).
+    async fn try_probe_latest(&self) -> Result<Option<CachedLatest>, TransactionalObjectError> {
+        let Some(mut cur) = self.latest_cache.lock().clone() else {
+            return Ok(None);
+        };
+        let mut walked = false;
+        for _ in 0..PROBE_LIMIT {
+            let next = cur.id.next();
+            match self.fetch_version(next).await? {
+                Some((e_tag, bytes)) => {
+                    cur = CachedLatest {
+                        id: next,
+                        e_tag,
+                        bytes,
+                    };
+                    walked = true;
+                }
+                None if walked => {
+                    // Freshly fetched on this walk — no revalidation needed.
+                    self.cache_latest(cur.clone());
+                    return Ok(Some(cur));
+                }
+                None => {
+                    return match self.revalidate_anchor(&cur).await? {
+                        Some(fresh) => {
+                            self.cache_latest(fresh.clone());
+                            Ok(Some(fresh))
+                        }
+                        None => {
+                            self.invalidate_cached(cur.id);
+                            Ok(None)
+                        }
+                    };
+                }
+            }
+        }
+        // Still finding versions after PROBE_LIMIT steps: remember how far we
+        // got, then let LIST jump the rest of the way.
+        self.cache_latest(cur);
+        Ok(None)
     }
 
     fn parse_id(&self, path: &Path) -> Result<MonotonicId, TransactionalObjectError> {
@@ -323,10 +467,12 @@ impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorage
             .map(|id| id.next())
             .unwrap_or(MonotonicId::initial());
         let path = self.path_for(id);
-        self.object_store
+        let bytes = self.codec.encode(new_value);
+        let put_result = self
+            .object_store
             .put_opts(
                 &path,
-                PutPayload::from_bytes(self.codec.encode(new_value)),
+                PutPayload::from_bytes(bytes.clone()),
                 PutOptions::from(PutMode::Create),
             )
             .await
@@ -337,29 +483,42 @@ impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorage
                     TransactionalObjectError::from(err)
                 }
             })?;
+        self.cache_latest(CachedLatest {
+            id,
+            e_tag: put_result.e_tag,
+            bytes,
+        });
         Ok(id)
     }
 
     async fn try_read_latest_unchecked(
         &self,
     ) -> Result<Option<(MonotonicId, T)>, TransactionalObjectError> {
+        if let Some(hit) = self.try_probe_latest().await? {
+            let value = self.codec.decode(&hit.bytes).map_err(CallbackError)?;
+            return Ok(Some((hit.id, value)));
+        }
         loop {
             let files = self.list(Unbounded, Unbounded).await?;
             if let Some(file) = files.last() {
-                let result = self
-                    .try_read_unchecked(file.id)
-                    .await
-                    .map(|opt| opt.map(|v| (file.id, v)));
-                match result {
+                match self.fetch_version(file.id).await? {
+                    Some((e_tag, bytes)) => {
+                        let value = self.codec.decode(&bytes).map_err(CallbackError)?;
+                        self.cache_latest(CachedLatest {
+                            id: file.id,
+                            e_tag,
+                            bytes,
+                        });
+                        return Ok(Some((file.id, value)));
+                    }
                     // File listed but not found. Probably deleted by GC. Retry list/read.
                     // See https://github.com/slatedb/slatedb/issues/1215 for more details.
-                    Ok(None) => {
+                    None => {
                         warn!(
                             "listed file missing on read, retrying [location={}]",
                             file.metadata.location,
                         );
                     }
-                    _ => return result,
                 }
             } else {
                 // No files found, so return None
@@ -421,7 +580,9 @@ impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorage
         self.object_store
             .delete(&path)
             .await
-            .map_err(TransactionalObjectError::from)
+            .map_err(TransactionalObjectError::from)?;
+        self.invalidate_cached(id);
+        Ok(())
     }
 }
 
@@ -573,6 +734,7 @@ mod tests {
         inner: InMemory,
         get_opts_calls: AtomicUsize,
         if_none_match_gets: AtomicUsize,
+        list_calls: AtomicUsize,
         blocking_not_found: StdMutex<Option<BlockingNotFoundGet>>,
     }
 
@@ -582,6 +744,7 @@ mod tests {
                 inner: InMemory::new(),
                 get_opts_calls: AtomicUsize::new(0),
                 if_none_match_gets: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
                 blocking_not_found: StdMutex::new(None),
             }
         }
@@ -654,6 +817,7 @@ mod tests {
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.list(prefix)
         }
 
@@ -921,6 +1085,7 @@ mod tests {
                 flaky_store.clone(),
                 "test",
             )),
+            latest_cache: parking_lot::Mutex::new(None),
         };
 
         let latest = store.try_read_latest().await.unwrap().unwrap();
@@ -930,5 +1095,110 @@ mod tests {
             flaky_store.list_calls.load(Ordering::SeqCst) >= 2,
             "expected try_read_latest to retry after a missing read"
         );
+    }
+
+    fn val(payload: u64) -> TestVal {
+        TestVal { epoch: 1, payload }
+    }
+
+    fn probe_store(
+        os: Arc<CountingGetStore>,
+    ) -> ObjectStoreSequencedStorageProtocol<TestVal> {
+        ObjectStoreSequencedStorageProtocol::new(
+            &Path::from("/root"),
+            os,
+            "test",
+            "val",
+            Box::new(TestValCodec),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_after_own_write_needs_no_list() {
+        let os = Arc::new(CountingGetStore::new());
+        let store = probe_store(os.clone());
+
+        let id = store.write(None, &val(1)).await.unwrap();
+        let baseline_lists = os.list_calls.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            let (latest_id, latest) = store.try_read_latest().await.unwrap().unwrap();
+            assert_eq!(id, latest_id);
+            assert_eq!(val(1), latest);
+        }
+        assert_eq!(
+            baseline_lists,
+            os.list_calls.load(Ordering::SeqCst),
+            "stable polls should probe from the write-seeded cache, not LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_probes_forward_over_external_writes() {
+        let os = Arc::new(CountingGetStore::new());
+        let ours = probe_store(os.clone());
+        let theirs = probe_store(os.clone());
+
+        let mut id = ours.write(None, &val(1)).await.unwrap();
+        ours.try_read_latest().await.unwrap().unwrap();
+        let baseline_lists = os.list_calls.load(Ordering::SeqCst);
+
+        // Another process advances the object a few versions.
+        id = theirs.write(Some(id), &val(2)).await.unwrap();
+        id = theirs.write(Some(id), &val(3)).await.unwrap();
+
+        let (latest_id, latest) = ours.try_read_latest().await.unwrap().unwrap();
+        assert_eq!(id, latest_id);
+        assert_eq!(val(3), latest);
+        assert_eq!(
+            baseline_lists,
+            os.list_calls.load(Ordering::SeqCst),
+            "a probe walk should absorb external writes without LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_far_behind_falls_back_to_one_list() {
+        let os = Arc::new(CountingGetStore::new());
+        let ours = probe_store(os.clone());
+        let theirs = probe_store(os.clone());
+
+        let mut id = ours.write(None, &val(1)).await.unwrap();
+        ours.try_read_latest().await.unwrap().unwrap();
+        let baseline_lists = os.list_calls.load(Ordering::SeqCst);
+
+        for i in 2..=20 {
+            id = theirs.write(Some(id), &val(i)).await.unwrap();
+        }
+
+        let (latest_id, latest) = ours.try_read_latest().await.unwrap().unwrap();
+        assert_eq!(id, latest_id);
+        assert_eq!(val(20), latest);
+        assert_eq!(
+            baseline_lists + 1,
+            os.list_calls.load(Ordering::SeqCst),
+            "beyond PROBE_LIMIT the read should jump to the tail with one LIST"
+        );
+
+        // The fallback reseeds the cache: the next stable poll probes again.
+        ours.try_read_latest().await.unwrap().unwrap();
+        assert_eq!(baseline_lists + 1, os.list_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_survives_anchor_deletion() {
+        let os = Arc::new(CountingGetStore::new());
+        let ours = probe_store(os.clone());
+        let theirs = probe_store(os.clone());
+
+        let first = ours.write(None, &val(1)).await.unwrap();
+        let second = ours.write(Some(first), &val(2)).await.unwrap();
+        ours.try_read_latest().await.unwrap().unwrap();
+
+        // GC (another process) removes the version our cache is anchored on.
+        theirs.delete_unchecked(second).await.unwrap();
+
+        let (latest_id, latest) = ours.try_read_latest_unchecked().await.unwrap().unwrap();
+        assert_eq!(first, latest_id);
+        assert_eq!(val(1), latest);
     }
 }

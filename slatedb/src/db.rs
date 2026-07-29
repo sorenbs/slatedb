@@ -3717,8 +3717,10 @@ mod tests {
         let expected_cache_parts =
             vec![
             ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000001.manifest", 0),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
-            ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000002.manifest", 1),
+            // The post-fence manifest refresh is served from the sequenced store's
+            // write-seeded latest-version cache, so no manifest bytes are ever
+            // fetched (or disk-cached) through the object store.
+            ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000002.manifest", 0),
             // The startup fence WAL is zero bytes, so replay does not cache any object parts.
             ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000001.sst", 0),
             ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000002.sst", 0),
@@ -7865,6 +7867,7 @@ mod tests {
                 min_age: Duration::from_millis(0),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             wal_fence_options: None,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
@@ -7872,18 +7875,21 @@ mod tests {
                 min_age: Duration::from_millis(0),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
                 interval: None,
                 min_age: Duration::from_millis(0),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
                 interval: None,
                 min_age: Duration::from_millis(0),
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             }),
             detach_options: None,
             metric_level: None,

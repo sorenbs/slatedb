@@ -14,7 +14,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask};
+use super::{CachedDirListing, GcFilter, GcStats, GcTask};
+use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 
 #[derive(Clone)]
 pub(crate) struct CompactedGcTask {
@@ -24,6 +25,7 @@ pub(crate) struct CompactedGcTask {
     stats: Arc<GcStats>,
     compacted_options: GarbageCollectorDirectoryOptions,
     gc_filter: Option<Arc<dyn GcFilter>>,
+    dir_listing: CachedDirListing<IdentifiedObjectMetadata<SsTableId>>,
 }
 
 impl std::fmt::Debug for CompactedGcTask {
@@ -50,6 +52,7 @@ impl CompactedGcTask {
             stats,
             compacted_options,
             gc_filter,
+            dir_listing: CachedDirListing::new(),
         }
     }
 
@@ -210,10 +213,16 @@ impl GcTask for CompactedGcTask {
             compaction_low_watermark_dt,
             newest_l0_dt,
         );
+        // The candidate inventory may be a cached listing (list_cache_ttl);
+        // every deletion anchor above (manifest view, compaction watermark,
+        // newest L0) is re-read fresh on each sweep.
         let ssts_to_delete = self
-            .table_store
-            // List all SSTs in the table store
-            .list_compacted_ssts(..)
+            .dir_listing
+            .entries(
+                utc_now,
+                self.compacted_options.list_cache_ttl,
+                self.table_store.list_compacted_ssts(..),
+            )
             .await?
             .into_iter()
             // Filter out SSTs that were more recently created than the cutoff_dt
@@ -236,6 +245,7 @@ impl GcTask for CompactedGcTask {
             );
         }
         let found = sst_ids_to_delete.len();
+        let mut deleted = HashSet::new();
         for id in sst_ids_to_delete {
             if self.compacted_options.dry_run {
                 log::debug!("dry run: would delete SST but skipped [id={:?}]", id);
@@ -245,9 +255,11 @@ impl GcTask for CompactedGcTask {
             if let Err(e) = self.table_store.delete_sst(&id).await {
                 error!("error deleting SST [id={:?}, error={}]", id, e);
             } else {
+                deleted.insert(id);
                 self.stats.gc_compacted_count.increment(1);
             }
         }
+        self.dir_listing.forget(|sst| deleted.contains(&sst.id));
 
         Ok(found)
     }
@@ -356,6 +368,7 @@ mod tests {
             min_age: Duration::from_secs(5),
             dry_run: false,
             max_interval: None,
+            list_cache_ttl: None,
         };
         let stats = Arc::new(GcStats::new(&recorder));
         let task = CompactedGcTask::new(
@@ -464,6 +477,7 @@ mod tests {
             min_age: Duration::from_secs(0),
             dry_run: false,
             max_interval: None,
+            list_cache_ttl: None,
         };
         let stats = Arc::new(GcStats::new(&recorder));
         let task = CompactedGcTask::new(
@@ -567,6 +581,7 @@ mod tests {
             min_age: Duration::from_secs(0),
             dry_run: false,
             max_interval: None,
+            list_cache_ttl: None,
         };
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
         let stats = Arc::new(GcStats::new(&recorder));
@@ -663,6 +678,7 @@ mod tests {
             min_age: Duration::from_secs(2),
             dry_run: false,
             max_interval: None,
+            list_cache_ttl: None,
         };
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
         let stats = Arc::new(GcStats::new(&recorder));

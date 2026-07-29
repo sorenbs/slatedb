@@ -27,7 +27,9 @@ use log::error;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask};
+use super::{CachedDirListing, GcFilter, GcStats, GcTask};
+use slatedb_common::object_metadata::IdentifiedObjectMetadata;
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub(crate) struct CompactionsGcTask {
@@ -35,6 +37,7 @@ pub(crate) struct CompactionsGcTask {
     stats: Arc<GcStats>,
     compactions_options: GarbageCollectorDirectoryOptions,
     gc_filter: Option<Arc<dyn GcFilter>>,
+    dir_listing: CachedDirListing<IdentifiedObjectMetadata<u64>>,
 }
 
 impl std::fmt::Debug for CompactionsGcTask {
@@ -57,6 +60,7 @@ impl CompactionsGcTask {
             stats,
             compactions_options,
             gc_filter,
+            dir_listing: CachedDirListing::new(),
         }
     }
 
@@ -71,16 +75,28 @@ impl GcTask for CompactionsGcTask {
     /// compactions file.
     async fn collect(&self, utc_now: DateTime<Utc>) -> Result<usize, SlateDBError> {
         let min_age = self.compactions_min_age();
-        let mut compactions_metadata_list = self.compactions_store.list_compactions(..).await?;
+        // The never-delete anchor (the latest compactions file) is read fresh
+        // every sweep; only the candidate inventory may come from a cached
+        // listing (list_cache_ttl). No latest record means nothing to judge.
+        let Some(latest) = self.compactions_store.try_read_latest_compactions().await? else {
+            return Ok(0);
+        };
+        let compactions_metadata_list = self
+            .dir_listing
+            .entries(
+                utc_now,
+                self.compactions_options.list_cache_ttl,
+                self.compactions_store.list_compactions(..),
+            )
+            .await?;
 
-        // Remove the last element so we never delete the latest compactions file
-        compactions_metadata_list.pop();
-
-        // Delete compactions files older than min_age
+        // Delete compactions files older than min_age, never the latest
         let compactions_to_delete = compactions_metadata_list
             .into_iter()
             .filter(|compactions_metadata| {
-                utc_now.signed_duration_since(compactions_metadata.metadata.last_modified) > min_age
+                compactions_metadata.id < latest.id
+                    && utc_now.signed_duration_since(compactions_metadata.metadata.last_modified)
+                        > min_age
             })
             .collect::<Vec<_>>();
 
@@ -102,6 +118,7 @@ impl GcTask for CompactionsGcTask {
             );
         }
         let found = compactions_to_delete.len();
+        let mut deleted = HashSet::new();
         for compactions_metadata in compactions_to_delete {
             if self.compactions_options.dry_run {
                 log::debug!(
@@ -120,9 +137,11 @@ impl GcTask for CompactionsGcTask {
                     compactions_metadata.id, e
                 );
             } else {
+                deleted.insert(compactions_metadata.id);
                 self.stats.gc_compactions_count.increment(1);
             }
         }
+        self.dir_listing.forget(|c| deleted.contains(&c.id));
 
         Ok(found)
     }
@@ -181,6 +200,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             },
             None,
         );
@@ -235,6 +255,7 @@ mod tests {
                 interval: None,
                 dry_run: false,
                 max_interval: None,
+                list_cache_ttl: None,
             },
             Some(Arc::new(DenyAllGcFilter) as Arc<dyn GcFilter>),
         );
