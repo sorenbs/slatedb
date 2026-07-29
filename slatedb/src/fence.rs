@@ -266,6 +266,7 @@ mod tests {
                     interval: None,
                     dry_run: false,
                     max_interval: None,
+                    list_cache_ttl: None,
                 }),
                 wal_fence_options: None,
                 compacted_options: None,

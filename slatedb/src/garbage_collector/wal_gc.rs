@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
+use super::{CachedDirListing, GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
+use std::collections::HashSet;
 
 /// Selects which class of WAL object a [`WalGcTask`] collects.
 ///
@@ -39,6 +40,7 @@ pub(crate) struct WalGcTask {
     wal_options: GarbageCollectorDirectoryOptions,
     mode: WalGcMode,
     gc_filter: Option<Arc<dyn GcFilter>>,
+    dir_listing: CachedDirListing<IdentifiedObjectMetadata<SsTableId>>,
 }
 
 impl std::fmt::Debug for WalGcTask {
@@ -66,6 +68,7 @@ impl WalGcTask {
             wal_options,
             mode,
             gc_filter,
+            dir_listing: CachedDirListing::new(),
         }
     }
 
@@ -147,11 +150,19 @@ impl GcTask for WalGcTask {
             .await?;
         let last_compacted_wal_sst_id = latest_manifest.manifest.core.replay_after_wal_id;
         let min_age = self.wal_sst_min_age();
+        // The candidate inventory may be a cached listing (list_cache_ttl);
+        // the deletion anchors above (latest manifest, checkpoint refs,
+        // replay boundary) are re-read fresh on every sweep.
         let ssts_to_delete = self
-            .table_store
-            .list_wal_ssts(..last_compacted_wal_sst_id)
+            .dir_listing
+            .entries(
+                utc_now,
+                self.wal_options.list_cache_ttl,
+                self.table_store.list_wal_ssts(..),
+            )
             .await?
             .into_iter()
+            .filter(|wal_sst| wal_sst.id.unwrap_wal_id() < last_compacted_wal_sst_id)
             .filter(|wal_sst| match self.mode {
                 // In regular mode, only consider WAL SSTs with size > 0 for deletion.
                 WalGcMode::Regular => wal_sst.metadata.size > 0,
@@ -175,7 +186,11 @@ impl GcTask for WalGcTask {
             .collect::<Vec<_>>();
 
         let found = sst_ids_to_delete.len();
-        self.maybe_delete_wal_ssts(sst_ids_to_delete).await;
+        self.maybe_delete_wal_ssts(sst_ids_to_delete.clone()).await;
+        // Attempted deletions leave the cached view; a failed delete
+        // resurfaces at the next listing refresh instead of retrying
+        // from a stale entry.
+        self.dir_listing.forget(|m| sst_ids_to_delete.contains(&m.id));
 
         Ok(found)
     }
