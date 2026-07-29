@@ -170,7 +170,7 @@ fn newest_l0_dt(manifest: &Manifest) -> DateTime<Utc> {
 impl GcTask for CompactedGcTask {
     /// Collect garbage from the compacted SSTs. This will delete any compacted SSTs that are
     /// older than the minimum age specified in the options and are not active in the manifest.
-    async fn collect(&self, utc_now: DateTime<Utc>) -> Result<(), SlateDBError> {
+    async fn collect(&self, utc_now: DateTime<Utc>) -> Result<usize, SlateDBError> {
         // Don't delete any SSTs that are more recent than the oldest actively running compaction job
         // since they might be an output SST from a compaction that hasn't yet been added to the
         // manifest (we write the sorted run SSTs, _then_ add them to the manifest and write the
@@ -235,6 +235,7 @@ impl GcTask for CompactedGcTask {
                 sst_ids_to_delete.len()
             );
         }
+        let found = sst_ids_to_delete.len();
         for id in sst_ids_to_delete {
             if self.compacted_options.dry_run {
                 log::debug!("dry run: would delete SST but skipped [id={:?}]", id);
@@ -248,7 +249,7 @@ impl GcTask for CompactedGcTask {
             }
         }
 
-        Ok(())
+        Ok(found)
     }
 
     fn resource(&self) -> &str {
@@ -354,6 +355,7 @@ mod tests {
             interval: None,
             min_age: Duration::from_secs(5),
             dry_run: false,
+            max_interval: None,
         };
         let stats = Arc::new(GcStats::new(&recorder));
         let task = CompactedGcTask::new(
@@ -461,6 +463,7 @@ mod tests {
             interval: None,
             min_age: Duration::from_secs(0),
             dry_run: false,
+            max_interval: None,
         };
         let stats = Arc::new(GcStats::new(&recorder));
         let task = CompactedGcTask::new(
@@ -563,6 +566,7 @@ mod tests {
             interval: None,
             min_age: Duration::from_secs(0),
             dry_run: false,
+            max_interval: None,
         };
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
         let stats = Arc::new(GcStats::new(&recorder));
@@ -658,6 +662,7 @@ mod tests {
             interval: None,
             min_age: Duration::from_secs(2),
             dry_run: false,
+            max_interval: None,
         };
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
         let stats = Arc::new(GcStats::new(&recorder));

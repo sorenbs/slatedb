@@ -69,7 +69,7 @@ impl GcTask for CompactionsGcTask {
     /// Collect garbage from the compactions store. This will delete any compactions files
     /// that are older than the minimum age specified in the options, excluding the latest
     /// compactions file.
-    async fn collect(&self, utc_now: DateTime<Utc>) -> Result<(), SlateDBError> {
+    async fn collect(&self, utc_now: DateTime<Utc>) -> Result<usize, SlateDBError> {
         let min_age = self.compactions_min_age();
         let mut compactions_metadata_list = self.compactions_store.list_compactions(..).await?;
 
@@ -101,6 +101,7 @@ impl GcTask for CompactionsGcTask {
                 compactions_to_delete.len()
             );
         }
+        let found = compactions_to_delete.len();
         for compactions_metadata in compactions_to_delete {
             if self.compactions_options.dry_run {
                 log::debug!(
@@ -123,7 +124,7 @@ impl GcTask for CompactionsGcTask {
             }
         }
 
-        Ok(())
+        Ok(found)
     }
 
     fn resource(&self) -> &str {
@@ -179,6 +180,7 @@ mod tests {
                 min_age: Duration::from_secs(1),
                 interval: None,
                 dry_run: false,
+                max_interval: None,
             },
             None,
         );
@@ -232,6 +234,7 @@ mod tests {
                 min_age: Duration::from_secs(1),
                 interval: None,
                 dry_run: false,
+                max_interval: None,
             },
             Some(Arc::new(DenyAllGcFilter) as Arc<dyn GcFilter>),
         );
