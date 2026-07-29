@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
 use super::{CachedDirListing, GcFilter, GcStats, GcTask};
+use futures::StreamExt;
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 
 #[derive(Clone)]
@@ -254,17 +255,32 @@ impl GcTask for CompactedGcTask {
         }
         let found = sst_ids_to_delete.len();
         let mut deleted = HashSet::new();
-        for id in sst_ids_to_delete {
-            if self.compacted_options.dry_run {
+        if self.compacted_options.dry_run {
+            for id in sst_ids_to_delete {
                 log::debug!("dry run: would delete SST but skipped [id={:?}]", id);
-                continue;
             }
-            log::info!("deleting SST [id={:?}]", id);
-            if let Err(e) = self.table_store.delete_sst(&id).await {
-                error!("error deleting SST [id={:?}, error={}]", id, e);
-            } else {
-                deleted.insert(id);
-                self.stats.gc_compacted_count.increment(1);
+        } else {
+            // Bounded-concurrency deletes: see wal_gc — a serial loop caps
+            // at 1/RTT and can fall behind churn on hot directories.
+            let results: Vec<(SsTableId, Result<(), SlateDBError>)> =
+                futures::stream::iter(sst_ids_to_delete.into_iter().map(|id| {
+                    let table_store = self.table_store.clone();
+                    async move {
+                        log::info!("deleting SST [id={:?}]", id);
+                        let r = table_store.delete_sst(&id).await;
+                        (id, r)
+                    }
+                }))
+                .buffer_unordered(super::GC_DELETE_CONCURRENCY)
+                .collect()
+                .await;
+            for (id, r) in results {
+                if let Err(e) = r {
+                    error!("error deleting SST [id={:?}, error={}]", id, e);
+                } else {
+                    deleted.insert(id);
+                    self.stats.gc_compacted_count.increment(1);
+                }
             }
         }
         self.dir_listing.forget(|sst| deleted.contains(&sst.id));

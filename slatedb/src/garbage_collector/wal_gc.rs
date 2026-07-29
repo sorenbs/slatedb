@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
 use super::{CachedDirListing, GcFilter, GcStats, GcTask};
+use futures::StreamExt;
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 use std::collections::HashSet;
 
@@ -139,6 +140,12 @@ impl GcTask for WalGcTask {
             })
             .collect::<Vec<_>>();
         self.dir_listing.note_sweep_at(utc_now, !ssts_to_delete.is_empty());
+        log::debug!(
+            "wal gc sweep [mode={:?}, boundary={}, candidates={}]",
+            self.mode,
+            last_compacted_wal_sst_id,
+            ssts_to_delete.len(),
+        );
         let ssts_to_delete = retain_allowed_by_gc_filter(&self.gc_filter, ssts_to_delete).await;
         let sst_ids_to_delete = ssts_to_delete
             .into_iter()
@@ -161,22 +168,40 @@ impl GcTask for WalGcTask {
         }
         let found = sst_ids_to_delete.len();
         let mut deleted = HashSet::new();
-        for id in sst_ids_to_delete {
-            if self.wal_options.dry_run {
+        if self.wal_options.dry_run {
+            for id in sst_ids_to_delete {
                 log::debug!(
                     "dry run: would delete {} but skipped [id={:?}]",
                     self.resource(),
                     id
                 );
-                continue;
             }
-            if let Err(e) = self.table_store.delete_sst(&id).await {
-                error!("error deleting WAL SST [id={:?}, error={}]", id, e);
-            } else {
-                deleted.insert(id);
-                match self.mode {
-                    WalGcMode::Regular => self.stats.gc_wal_count.increment(1),
-                    WalGcMode::Fence => self.stats.gc_wal_fence_count.increment(1),
+        } else {
+            // Deletes run with bounded concurrency: a serial loop caps at
+            // 1/RTT (40/s at 25 ms), which is BELOW hot-shard WAL churn —
+            // sweeps ballooned into multi-minute drains that starved the
+            // whole GC actor and let retention diverge (waldbg repro:
+            // candidate bursts 940 → 1,865 → 6,397).
+            let results: Vec<(SsTableId, Result<(), SlateDBError>)> =
+                futures::stream::iter(sst_ids_to_delete.into_iter().map(|id| {
+                    let table_store = self.table_store.clone();
+                    async move {
+                        let r = table_store.delete_sst(&id).await;
+                        (id, r)
+                    }
+                }))
+                .buffer_unordered(super::GC_DELETE_CONCURRENCY)
+                .collect()
+                .await;
+            for (id, r) in results {
+                if let Err(e) = r {
+                    error!("error deleting WAL SST [id={:?}, error={}]", id, e);
+                } else {
+                    deleted.insert(id);
+                    match self.mode {
+                        WalGcMode::Regular => self.stats.gc_wal_count.increment(1),
+                        WalGcMode::Fence => self.stats.gc_wal_fence_count.increment(1),
+                    }
                 }
             }
         }

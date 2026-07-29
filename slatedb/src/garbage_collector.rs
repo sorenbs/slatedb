@@ -55,6 +55,12 @@ pub use filter::GcFilter;
 pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(300);
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const GC_TASK_NAME: &str = "garbage_collector";
+/// Bounded fan-out for GC object deletion. A serial delete loop caps at
+/// 1/RTT and falls behind hot-directory churn (measured: 25 ms store →
+/// 40 deletes/s ceiling vs ~36/s WAL churn — one dead window from
+/// divergence); modest concurrency makes sweep duration proportional to
+/// backlog/16 instead.
+pub(super) const GC_DELETE_CONCURRENCY: usize = 16;
 
 trait GcTask {
     fn resource(&self) -> &str;
@@ -128,6 +134,7 @@ impl<M: Clone> CachedDirListing<M> {
             }
         }
         let fresh = list.await?;
+        log::debug!("gc dir view refreshed [entries={}]", fresh.len());
         let mut view = self.view.lock();
         view.listed = Some((utc_now, fresh.clone()));
         view.exhausted_since = None;
@@ -1165,6 +1172,90 @@ mod tests {
         let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].id, id2);
+    }
+
+    /// The soak regression shape: with `list_cache_ttl` set, WAL churn that
+    /// entirely postdates the cached inventory must still be collected once
+    /// the exhaustion floor passes — era after era, indefinitely.
+    #[tokio::test]
+    async fn test_cached_view_keeps_collecting_wal_under_continuous_churn() {
+        let (manifest_store, _compactions_store, table_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::new("/");
+
+        let age_all = |ids: std::ops::RangeInclusive<u64>| {
+            for i in ids {
+                set_modified(
+                    local_object_store.clone(),
+                    &path_resolver.table_path(&SsTableId::Wal(i)),
+                    86400,
+                );
+            }
+        };
+
+        // Era 1: wals 1..=3, old, all below replay_after.
+        for i in 1..=3u64 {
+            write_sst(table_store.clone(), &SsTableId::Wal(i)).await.unwrap();
+        }
+        age_all(1..=3);
+        let mut state = ManifestCore::new();
+        state.replay_after_wal_id = 4;
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            state,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        let recorder = MetricsRecorderHelper::noop();
+        let task = WalGcTask::new(
+            manifest_store.clone(),
+            table_store.clone(),
+            Arc::new(GcStats::new(&recorder)),
+            GarbageCollectorDirectoryOptions {
+                interval: Some(Duration::from_secs(30)),
+                min_age: Duration::from_secs(60),
+                dry_run: false,
+                max_interval: None,
+                list_cache_ttl: Some(Duration::from_secs(3600)),
+            },
+            WalGcMode::Regular,
+            None,
+        );
+
+        let t0 = Utc::now();
+        task.collect(t0).await.unwrap();
+        assert_eq!(
+            0,
+            table_store.list_wal_ssts(..).await.unwrap().len(),
+            "era-1 wals should be deleted from the fresh inventory"
+        );
+
+        // Era 2 arrives entirely AFTER the cached listing.
+        for i in 4..=6u64 {
+            write_sst(table_store.clone(), &SsTableId::Wal(i)).await.unwrap();
+        }
+        age_all(4..=6);
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.replay_after_wal_id = 7;
+        stored_manifest.update(dirty).await.unwrap();
+
+        // Stale-view sweep: era 2 is invisible; this arms the refresh floor.
+        task.collect(t0 + TimeDelta::seconds(30)).await.unwrap();
+        assert_eq!(
+            3,
+            table_store.list_wal_ssts(..).await.unwrap().len(),
+            "the stale view cannot see era-2 churn yet"
+        );
+
+        // Past the floor: the view must refresh and era 2 must go.
+        task.collect(t0 + TimeDelta::seconds(95)).await.unwrap();
+        assert_eq!(
+            0,
+            table_store.list_wal_ssts(..).await.unwrap().len(),
+            "post-floor refresh must collect churn that postdates the old view"
+        );
     }
 
     #[tokio::test]
