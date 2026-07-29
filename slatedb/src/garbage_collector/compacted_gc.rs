@@ -216,12 +216,12 @@ impl GcTask for CompactedGcTask {
         // The candidate inventory may be a cached listing (list_cache_ttl);
         // every deletion anchor above (manifest view, compaction watermark,
         // newest L0) is re-read fresh on each sweep.
-        let refresh_floor = self.compacted_options.min_age.max(
-            self.compacted_options
-                .interval
-                .unwrap_or(super::DEFAULT_INTERVAL)
-                * 2,
-        );
+        let refresh_floor = (self
+            .compacted_options
+            .interval
+            .unwrap_or(super::DEFAULT_INTERVAL)
+            * 2)
+        .max(std::time::Duration::from_secs(60));
         let ssts_to_delete = self
             .dir_listing
             .entries(
@@ -239,7 +239,7 @@ impl GcTask for CompactedGcTask {
             // Filter out SSTs that are active in the manifest (including actively checkpointed SSTs)
             .filter(|sst| !active_ssts.contains(&sst.id))
             .collect::<Vec<_>>();
-        self.dir_listing.note_sweep(!ssts_to_delete.is_empty());
+        self.dir_listing.note_sweep_at(utc_now, !ssts_to_delete.is_empty());
         let ssts_to_delete = retain_allowed_by_gc_filter(&self.gc_filter, ssts_to_delete).await;
         let sst_ids_to_delete = ssts_to_delete
             .into_iter()
