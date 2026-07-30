@@ -824,6 +824,12 @@ impl TokioCompactionExecutorInner {
             None;
 
         let mut entries_since_yield: u32 = 0;
+        // EXPERIMENT KNOB (exp/merge-yield-isolation only): sweep the
+        // yield interval. 0 disables the merge-loop yield entirely.
+        let yield_every: u32 = std::env::var("YIELD_MERGE_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
         while let Some(kv) = all_iter.next().await? {
             // Cooperative scheduling point for long ready-to-ready runs:
             // when the source blocks are already fetched, next()/add()
@@ -832,7 +838,7 @@ impl TokioCompactionExecutorInner {
             // in the SST builder only fire when a block fills). Yield
             // every 1024 entries so compaction never monopolizes a worker.
             entries_since_yield += 1;
-            if entries_since_yield >= 1024 {
+            if yield_every > 0 && entries_since_yield >= yield_every {
                 entries_since_yield = 0;
                 // EXPERIMENT GATE (exp/merge-yield-isolation only).
                 if std::env::var("YIELD_MERGE").map(|v| v != "0").unwrap_or(true) {
