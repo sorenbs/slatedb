@@ -282,6 +282,7 @@ mod tests {
                 list_cache_ttl: Some(Duration::from_secs(7200)),
             },
             None,
+            true,
         );
 
         // First sweep caches the inventory [1, 2]: deletes 1, keeps latest 2.
@@ -331,6 +332,8 @@ mod tests {
             manifest_store.clone(),
             Arc::new(GcStats::new(&recorder)),
             GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
+                max_interval: None,
                 min_age: Duration::from_secs(1),
                 interval: None,
                 dry_run: false,

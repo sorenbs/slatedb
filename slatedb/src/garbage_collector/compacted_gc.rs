@@ -955,6 +955,8 @@ mod tests {
             gc_table_store.clone(),
             Arc::new(GcStats::new(&recorder)),
             GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
+                max_interval: None,
                 interval: None,
                 min_age: Duration::from_secs(5),
                 dry_run: false,

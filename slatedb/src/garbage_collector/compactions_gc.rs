@@ -285,6 +285,8 @@ mod tests {
             compactions_store.clone(),
             Arc::new(GcStats::new(&recorder)),
             GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
+                max_interval: None,
                 min_age: Duration::from_secs(1),
                 interval: None,
                 dry_run: false,

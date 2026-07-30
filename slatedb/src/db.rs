@@ -7986,6 +7986,7 @@ mod tests {
         // the manifest is still not updated.
         let gc_options = GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
                 interval: None,
                 min_age: Duration::from_millis(0),
                 dry_run: false,
@@ -7993,18 +7994,21 @@ mod tests {
             }),
             wal_fence_options: None,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
                 interval: None,
                 min_age: Duration::from_millis(0),
                 dry_run: false,
                 max_interval: None,
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
                 interval: None,
                 min_age: Duration::from_millis(0),
                 dry_run: false,
                 max_interval: None,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
+                list_cache_ttl: None,
                 interval: None,
                 min_age: Duration::from_millis(0),
                 dry_run: false,
