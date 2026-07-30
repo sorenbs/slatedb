@@ -214,7 +214,7 @@ pub struct GarbageCollector {
     /// next tick instant that is allowed to do real work). Ticks arriving
     /// before `next_allowed` return without any I/O. Only consulted for
     /// directories whose options set `max_interval`.
-    backoff: std::collections::HashMap<&'static str, (u32, std::time::Instant)>,
+    backoff: std::collections::HashMap<&'static str, (u32, DateTime<Utc>)>,
     manifest_gc_task: Option<ManifestGcTask>,
     wal_gc_task: Option<WalGcTask>,
     wal_fence_gc_task: Option<WalGcTask>,
@@ -303,7 +303,7 @@ impl MessageHandler<GcMessage> for GarbageCollector {
         };
         if max.is_some() {
             if let Some((_, next_allowed)) = self.backoff.get(resource) {
-                if std::time::Instant::now() < *next_allowed {
+                if self.system_clock.now() < *next_allowed {
                     return Ok(());
                 }
             }
@@ -361,7 +361,14 @@ impl MessageHandler<GcMessage> for GarbageCollector {
             };
             let delay = next_gc_delay(base, max, streak);
             self.backoff
-                .insert(resource, (streak, std::time::Instant::now() + delay));
+                .insert(
+                    resource,
+                    (
+                        streak,
+                        self.system_clock.now()
+                            + chrono::Duration::from_std(delay).expect("gc delay overflows"),
+                    ),
+                );
         }
         Ok(())
     }
