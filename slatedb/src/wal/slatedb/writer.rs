@@ -487,10 +487,17 @@ struct WalFlushHandler {
 
 impl WalFlushHandler {
     #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
-    async fn do_flush(&self) -> Result<(), SlateDBError> {
+    /// Writes every frozen WAL. `freeze` first freezes the current WAL, for a
+    /// flush the timer or the size trigger asked for. An explicit
+    /// [`SlateDbWalWriter::flush`] froze the current WAL when it was called,
+    /// so a write appended since waits for the next flush instead of costing
+    /// a WAL object of its own.
+    async fn do_flush(&self, freeze: bool) -> Result<(), SlateDBError> {
         let flushing_wals = {
             let mut inner = self.inner.write();
-            inner.freeze_current_wal();
+            if freeze {
+                inner.freeze_current_wal();
+            }
             inner.flushing_wals()
         };
 
@@ -562,11 +569,11 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
         match message {
             WalFlushWork::Flush { result_tx } => {
                 if let Some(result_tx) = result_tx {
-                    let result = self.do_flush().await;
+                    let result = self.do_flush(false).await;
                     let _ = result_tx.send(result.clone().map_err(WalError::from));
                     Ok(result?)
                 } else {
-                    Ok(self.do_flush().await?)
+                    Ok(self.do_flush(true).await?)
                 }
             }
             WalFlushWork::Subscribe { listener } => {
@@ -935,6 +942,54 @@ mod tests {
         let empty = writer.flush().await.unwrap();
         assert_eq!(empty.wal_id, 2);
         empty.completion.await.unwrap();
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_flush_writes_only_the_wals_frozen_by_its_call() {
+        let (mut writer, table_store, _, _) =
+            setup_wal_buffer_with_flush_interval(Duration::from_secs(3600)).await;
+        writer
+            .append(&[make_entry("before", "v1", 1, None)])
+            .await
+            .unwrap();
+        let first = writer.flush().await.unwrap();
+        assert_eq!(first.wal_id, 1);
+        // Appended after the flush call froze WAL 1, before its upload runs.
+        writer
+            .append(&[make_entry("after", "v2", 2, None)])
+            .await
+            .unwrap();
+        first.completion.await.unwrap();
+
+        // The flush wrote WAL 1 alone: the later append waits in the
+        // current WAL for the next flush instead of costing a WAL object of
+        // its own. Durability follows the WALs written, not the call: the
+        // durable sequence (what WalFlushed publishes and durability waiters
+        // and acknowledgers wait on) covers seq 1, everything the call froze,
+        // and not seq 2, so nothing appended after the call is reported
+        // durable before a WAL holding it is written.
+        let status = writer.status().unwrap();
+        assert_eq!(status.last_flushed_wal_id, first.wal_id);
+        assert_eq!(status.last_flushed_seq, Some(1));
+        assert_eq!(status.buffered_wal_entries_count, 1);
+
+        let second = writer.flush().await.unwrap();
+        assert_eq!(second.wal_id, 2);
+        second.completion.await.unwrap();
+        let status = writer.status().unwrap();
+        assert_eq!(status.last_flushed_wal_id, second.wal_id);
+        assert_eq!(status.last_flushed_seq, Some(2));
+        assert_eq!(status.buffered_wal_entries_count, 0);
+        for (wal_id, key) in [(1, "before"), (2, "after")] {
+            let table = table_store.open_sst(wal_id.into()).await.unwrap();
+            let mut iter =
+                WalSstIterator::new(table, table_store.clone(), WalSstIteratorOptions::default())
+                    .await
+                    .unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().key, Bytes::from(key));
+            assert!(iter.next().await.unwrap().is_none());
+        }
         writer.close().await.unwrap();
     }
 
