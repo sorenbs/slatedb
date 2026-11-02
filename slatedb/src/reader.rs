@@ -66,6 +66,8 @@ pub(crate) struct Reader {
     pub(crate) mono_clock: Arc<MonotonicClock>,
     pub(crate) oracle: Arc<dyn Oracle>,
     pub(crate) read_merge_operator: Option<MergeOperatorType>,
+    /// Older sources a point lookup probes at once (`Settings::point_lookup_parallelism`).
+    pub(crate) point_lookup_parallelism: usize,
 }
 
 impl Reader {
@@ -89,7 +91,14 @@ impl Reader {
             mono_clock,
             oracle,
             read_merge_operator,
+            point_lookup_parallelism: crate::config::default_point_lookup_parallelism(),
         }
+    }
+
+    /// The reader probes at most `n` older sources at once in a point lookup.
+    pub(crate) fn with_point_lookup_parallelism(mut self, n: usize) -> Self {
+        self.point_lookup_parallelism = n.max(1);
+        self
     }
 
     /// Determines the maximum sequence number for read operations (get and scan). Read operations will filter
@@ -186,6 +195,7 @@ impl Reader {
             range: range.clone(),
             sst_iter_options: sst_iter_options.clone(),
             max_parallel,
+            point_lookahead: max_parallel.min(self.point_lookup_parallelism).max(1),
             point_lookup_stats,
             db_stats: self.db_stats.clone(),
             read_trace,
@@ -518,7 +528,9 @@ mod tests {
     use crate::merge_operator::{
         MergeOperator, MergeOperatorError, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
-    use crate::test_utils::{lookup_merge_operator_operands, RecordedSpan, SpanRecorder};
+    use crate::test_utils::{
+        lookup_merge_operator_operands, GatedObjectStore, RecordedSpan, SpanRecorder,
+    };
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
     use rstest::rstest;
@@ -598,7 +610,10 @@ mod tests {
 
     impl TestDbState {
         async fn new() -> Self {
-            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            Self::with_object_store(Arc::new(InMemory::new()))
+        }
+
+        fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
             let table_store = Arc::new(TableStore::new(
                 object_store,
                 SsTableFormat::default(),
@@ -2413,6 +2428,71 @@ mod tests {
             Some(0)
         );
 
+        Ok(())
+    }
+
+    /// A point lookup probes at most `point_lookup_parallelism` older sources at
+    /// once: with 1 it stops at the source holding the key and reads no filter
+    /// of the ones below it.
+    #[rstest::rstest]
+    #[case::default_four(4, 3)]
+    #[case::one(1, 1)]
+    #[tokio::test]
+    async fn should_probe_at_most_point_lookup_parallelism_older_sources(
+        #[case] parallelism: usize,
+        #[case] concurrent: usize,
+    ) -> Result<(), SlateDBError> {
+        // The newest L0 spans the key but lacks it; the three below it each
+        // hold a version.
+        let entries = vec![
+            TestEntry::value(b"key", b"oldest", 10).with_location(LayerLocation::L0Sst(0)),
+            TestEntry::value(b"key", b"older", 20).with_location(LayerLocation::L0Sst(1)),
+            TestEntry::value(b"key", b"newest", 30).with_location(LayerLocation::L0Sst(2)),
+            TestEntry::value(b"a", b"x", 40).with_location(LayerLocation::L0Sst(3)),
+            TestEntry::value(b"z", b"x", 41).with_location(LayerLocation::L0Sst(3)),
+        ];
+        let store = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let mut test_db_state = TestDbState::with_object_store(store.clone());
+        let write_batch = populate_db_state(&mut test_db_state, entries).await?;
+
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let db_stats = DbStats::new(&helper);
+        let reader = build_reader(&test_db_state, db_stats, false)
+            .await
+            .with_point_lookup_parallelism(parallelism);
+
+        let gate = &store.get_opts_gate;
+        gate.close();
+        let read_options = ReadOptions::default().with_dirty(true);
+        let lookup = reader.get_key_value_with_options(
+            b"key",
+            &read_options,
+            &test_db_state,
+            wb_point_iter(&write_batch, b"key"),
+            None,
+        );
+        let probe = async {
+            // The newest source reads its filter alone and finds no key.
+            gate.wait_for_arrivals(1).await;
+            gate.admit(1);
+            // The older sources then read their filters, at most
+            // `parallelism` of them at the same time.
+            gate.wait_for_arrivals(1 + concurrent).await;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            let arrived = gate.arrivals();
+            gate.release();
+            arrived
+        };
+        let (result, arrived) = tokio::join!(lookup, probe);
+
+        assert_eq!(arrived, 1 + concurrent);
+        assert_eq!(
+            result?.map(|kv| kv.value),
+            Some(Bytes::from_static(b"newest"))
+        );
         Ok(())
     }
 

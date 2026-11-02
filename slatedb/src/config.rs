@@ -213,6 +213,11 @@ use crate::error::SlateDBError;
 
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
 
+/// The default [`Settings::point_lookup_parallelism`].
+pub(crate) fn default_point_lookup_parallelism() -> usize {
+    4
+}
+
 fn default_true() -> bool {
     true
 }
@@ -804,6 +809,16 @@ pub struct Settings {
     /// If compaction cannot keep up, writes can stall at `l0_max_ssts`.
     pub l0_flush_parallelism: usize,
 
+    /// How many older sources a point lookup probes at the same time, beside the
+    /// newest one. Each probe reads a filter, and an index and a block when the
+    /// filter matches. A lookup that finds its key in a newer source drops the
+    /// probes still running, but their reads finish anyway. `1` probes the
+    /// sources one after another, so a lookup reads nothing past the source
+    /// that holds its key; a larger value lowers the latency of lookups that
+    /// pass through several sources. Must be at least 1.
+    #[serde(default = "default_point_lookup_parallelism")]
+    pub point_lookup_parallelism: usize,
+
     /// Defines the max number of unflushed key/value pair bytes that should reside in memory
     /// before applying backpressure to writers. This includes key/value pairs in both the
     /// immutable WAL flush queue and the immutable memtable flush queue. Writes will be
@@ -885,6 +900,7 @@ impl std::fmt::Debug for Settings {
             .field("l0_max_ssts", &self.l0_max_ssts)
             .field("l0_max_ssts_per_key", &self.l0_max_ssts_per_key)
             .field("l0_flush_parallelism", &self.l0_flush_parallelism)
+            .field("point_lookup_parallelism", &self.point_lookup_parallelism)
             .field("compactor_options", &self.compactor_options)
             .field("compression_codec", &self.compression_codec)
             .field(
@@ -912,6 +928,12 @@ impl Settings {
     /// Returns an [`crate::Error`] with [`crate::ErrorKind::Invalid`] describing
     /// the first invalid setting or combination encountered.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.point_lookup_parallelism == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "point_lookup_parallelism must be at least 1".into(),
+            )
+            .into());
+        }
         if self.l0_flush_parallelism == 0 {
             return Err(SlateDBError::InvalidConfiguration(
                 "l0_flush_parallelism must be at least 1".into(),
@@ -1118,6 +1140,7 @@ impl Default for Settings {
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 4,
+            point_lookup_parallelism: default_point_lookup_parallelism(),
             compactor_options: Some(CompactorOptions::default()),
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),

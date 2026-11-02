@@ -170,7 +170,8 @@ impl DbInner {
             mono_clock.clone(),
             oracle.clone(),
             merge_operator.clone(),
-        );
+        )
+        .with_point_lookup_parallelism(settings.point_lookup_parallelism);
 
         let txn_manager = Arc::new(TransactionManager::new(oracle.clone(), rand.clone()));
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
@@ -7944,6 +7945,7 @@ mod tests {
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 1,
+            point_lookup_parallelism: 4,
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,

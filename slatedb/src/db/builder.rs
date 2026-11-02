@@ -2601,6 +2601,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_db_builder_rejects_zero_point_lookup_parallelism() {
+        let result = crate::Db::builder(
+            "test_db_builder_rejects_zero_point_lookup_parallelism",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(Settings {
+            point_lookup_parallelism: 0,
+            ..Settings::default()
+        })
+        .build()
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected invalid point_lookup_parallelism to fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err.kind(), ErrorKind::Invalid));
+        assert!(
+            err.to_string()
+                .contains("point_lookup_parallelism must be at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_db_builder_rejects_low_max_wal_flushes_before_l0_flush() {
         let result = crate::Db::builder(
             "test_db_builder_rejects_low_max_wal_flushes_before_l0_flush",

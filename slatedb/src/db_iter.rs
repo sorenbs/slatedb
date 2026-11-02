@@ -124,13 +124,13 @@ impl GetIterator {
     /// older SST.
     ///
     /// After the newest source, the iterator initializes up to
-    /// `ctx.max_parallel` sources at the same time. Their metadata fetches
+    /// `ctx.point_lookahead` sources at the same time. Their metadata fetches
     /// overlap. An absent key requires
-    /// `1 + ceil((sources - 1) / max_parallel)` round trips, instead of one
+    /// `1 + ceil((sources - 1) / point_lookahead)` round trips, instead of one
     /// round trip for each source.
     ///
     /// If a hit occurs after the newest source, the iterator can initialize up
-    /// to `max_parallel - 1` extra sources. Each extra source reads a filter.
+    /// to `point_lookahead - 1` extra sources. Each extra source reads a filter.
     /// If the filter is positive, the source also reads an index and one data
     /// block. The iterator drops pending `init` calls when the walk stops. It
     /// cannot stop the block fetches that those calls started, so the fetches
@@ -148,7 +148,7 @@ impl GetIterator {
         let l0 = build_l0_point_iters(&tree.l0, ctx)?;
         let sr = build_sr_point_iters(&key, &tree.compacted, ctx)?;
         let iters = apply_filters(l0.into_iter().chain(sr), max_seq);
-        Ok(Self::with_lookahead(key, iters, ctx.max_parallel))
+        Ok(Self::with_lookahead(key, iters, ctx.point_lookahead))
     }
 }
 

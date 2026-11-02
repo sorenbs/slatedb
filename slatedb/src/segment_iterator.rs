@@ -30,6 +30,8 @@ pub(crate) struct SegmentScanContext {
     pub(crate) range: BytesRange,
     pub(crate) sst_iter_options: SstIteratorOptions,
     pub(crate) max_parallel: usize,
+    /// Older sources a point lookup probes at once, at most `max_parallel`.
+    pub(crate) point_lookahead: usize,
     /// Stats for point-query SSTs (optional — propagated from
     /// `ReadOptions`).
     pub(crate) point_lookup_stats: Option<DbStats>,

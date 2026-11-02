@@ -2052,6 +2052,7 @@ mod tests {
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 1,
+            point_lookup_parallelism: 4,
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
